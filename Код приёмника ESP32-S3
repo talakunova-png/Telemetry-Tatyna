@@ -1,0 +1,168 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+#define ESPNOW_CHANNEL 1
+
+// Структура должна быть ТОЧНО такой же, как у передатчика
+typedef struct __attribute__((packed)) TelemetryPacket {
+  uint32_t packetId;
+  uint32_t timeMs;
+
+  float temperature;
+  float pressure;
+  float humidity;
+
+  float accelX;
+  float accelY;
+  float accelZ;
+
+  float gyroX;
+  float gyroY;
+  float gyroZ;
+
+  uint8_t gpsValid;
+  double latitude;
+  double longitude;
+  float speedKmh;
+  float altitudeM;
+  uint8_t satellites;
+
+  uint8_t acsValid;
+  float acsVoltage;
+  float currentA;
+} TelemetryPacket;
+
+TelemetryPacket receivedData;
+
+// ================== ПРИЁМ ДАННЫХ ==================
+void onDataRecv(const esp_now_recv_info_t *recvInfo, const uint8_t *incomingData, int len) {
+  if (len != sizeof(receivedData)) {
+    Serial.println("Received packet size mismatch!");
+
+    Serial.print("Expected: ");
+    Serial.print(sizeof(receivedData));
+    Serial.print(" bytes | Got: ");
+    Serial.print(len);
+    Serial.println(" bytes");
+
+    return;
+  }
+
+  memcpy(&receivedData, incomingData, sizeof(receivedData));
+
+  Serial.println("========== RECEIVED TELEMETRY ==========");
+
+  Serial.print("Packet ID: ");
+  Serial.println(receivedData.packetId);
+
+  Serial.print("Time: ");
+  Serial.print(receivedData.timeMs);
+  Serial.println(" ms");
+
+  Serial.println("----- BME280 -----");
+
+  Serial.print("Temperature: ");
+  Serial.print(receivedData.temperature, 2);
+  Serial.println(" C");
+
+  Serial.print("Pressure: ");
+  Serial.print(receivedData.pressure, 2);
+  Serial.println(" hPa");
+
+  Serial.print("Humidity: ");
+  Serial.print(receivedData.humidity, 2);
+  Serial.println(" %");
+
+  Serial.println("----- MPU9250 ACCEL -----");
+
+  Serial.print("Accel X: ");
+  Serial.print(receivedData.accelX, 2);
+  Serial.println(" g");
+
+  Serial.print("Accel Y: ");
+  Serial.print(receivedData.accelY, 2);
+  Serial.println(" g");
+
+  Serial.print("Accel Z: ");
+  Serial.print(receivedData.accelZ, 2);
+  Serial.println(" g");
+
+  Serial.println("----- MPU9250 GYRO -----");
+
+  Serial.print("Gyro X: ");
+  Serial.print(receivedData.gyroX, 2);
+  Serial.println(" deg/s");
+
+  Serial.print("Gyro Y: ");
+  Serial.print(receivedData.gyroY, 2);
+  Serial.println(" deg/s");
+
+  Serial.print("Gyro Z: ");
+  Serial.print(receivedData.gyroZ, 2);
+  Serial.println(" deg/s");
+
+  Serial.println("----- GPS -----");
+
+  Serial.print("GPS valid: ");
+  Serial.println(receivedData.gpsValid ? "YES" : "NO");
+
+  Serial.print("Latitude: ");
+  Serial.println(receivedData.latitude, 6);
+
+  Serial.print("Longitude: ");
+  Serial.println(receivedData.longitude, 6);
+
+  Serial.print("Speed: ");
+  Serial.print(receivedData.speedKmh, 2);
+  Serial.println(" km/h");
+
+  Serial.print("Altitude: ");
+  Serial.print(receivedData.altitudeM, 2);
+  Serial.println(" m");
+
+  Serial.print("Satellites: ");
+  Serial.println(receivedData.satellites);
+
+  Serial.println("----- ACS712 -----");
+
+  Serial.print("ACS valid: ");
+  Serial.println(receivedData.acsValid ? "YES" : "NO");
+
+  Serial.print("ACS voltage: ");
+  Serial.print(receivedData.acsVoltage, 3);
+  Serial.println(" V");
+
+  Serial.print("Current: ");
+  Serial.print(receivedData.currentA, 3);
+  Serial.println(" A");
+
+  Serial.println("========================================");
+}
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("Telemetry receiver started...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed!");
+    return;
+  }
+
+  esp_now_register_recv_cb(onDataRecv);
+
+  Serial.println("ESP-NOW receiver ready");
+}
+
+// ================== LOOP ==================
+void loop() {
+  // Данные принимаются автоматически в onDataRecv()
+}
