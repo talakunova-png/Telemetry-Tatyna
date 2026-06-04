@@ -1,0 +1,284 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <Wire.h>
+#include <Adafruit_BME280.h>
+#include <TinyGPSPlus.h>
+#include <MPU9250_asukiaaa.h>
+
+// ================== ПИНЫ ==================
+#define I2C_SDA 17
+#define I2C_SCL 18
+
+#define GPS_RX_PIN 12   // TX GPS -> GPIO12 ESP32
+#define GPS_TX_PIN 13   // RX GPS -> GPIO13 ESP32
+
+#define ACS_PIN 4       // OUT ACS712 через делитель -> GPIO4
+
+#define ESPNOW_CHANNEL 1
+
+// ================== ACS712 ==================
+// Делитель: OUT ACS712 -> 10 кОм -> GPIO -> 20 кОм -> GND
+const float ACS_DIVIDER_K = 1.5;
+
+// ACS712-20A = 0.100 V/A
+// ACS712-5A  = 0.185 V/A
+// ACS712-30A = 0.066 V/A
+const float ACS_SENSITIVITY = 0.100;
+
+float acsZeroVoltage = 2.50;
+
+// ================== ДАТЧИКИ ==================
+Adafruit_BME280 bme;
+MPU9250_asukiaaa mpu;
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1);
+
+bool bmeOK = false;
+
+// ================== ESP-NOW ==================
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// Структура должна быть одинаковой у передатчика и приёмника
+typedef struct __attribute__((packed)) TelemetryPacket {
+  uint32_t packetId;
+  uint32_t timeMs;
+
+  float temperature;
+  float pressure;
+  float humidity;
+
+  float accelX;
+  float accelY;
+  float accelZ;
+
+  float gyroX;
+  float gyroY;
+  float gyroZ;
+
+  uint8_t gpsValid;
+  double latitude;
+  double longitude;
+  float speedKmh;
+  float altitudeM;
+  uint8_t satellites;
+
+  uint8_t acsValid;
+  float acsVoltage;
+  float currentA;
+} TelemetryPacket;
+
+TelemetryPacket telemetry;
+uint32_t packetCounter = 0;
+
+// ================== ACS712 ФУНКЦИИ ==================
+float readAcsVoltage() {
+  const int samples = 30;
+  float sumVoltageGPIO = 0;
+
+  for (int i = 0; i < samples; i++) {
+    sumVoltageGPIO += analogReadMilliVolts(ACS_PIN) / 1000.0;
+    delay(2);
+  }
+
+  float voltageGPIO = sumVoltageGPIO / samples;
+  float voltageACS = voltageGPIO * ACS_DIVIDER_K;
+
+  return voltageACS;
+}
+
+void calibrateAcsZero() {
+  Serial.println("ACS712 calibration started...");
+  Serial.println("Do not connect load for 2 seconds...");
+  delay(2000);
+
+  const int samples = 100;
+  float sum = 0;
+
+  for (int i = 0; i < samples; i++) {
+    sum += readAcsVoltage();
+    delay(5);
+  }
+
+  float zero = sum / samples;
+
+  if (zero > 1.0 && zero < 4.0) {
+    acsZeroVoltage = zero;
+    Serial.print("ACS712 zero voltage: ");
+    Serial.print(acsZeroVoltage, 3);
+    Serial.println(" V");
+  } else {
+    acsZeroVoltage = 2.50;
+    Serial.println("ACS712 signal error. Zero voltage set to 2.500 V");
+  }
+}
+
+float calculateCurrent(float acsVoltage) {
+  return (acsVoltage - acsZeroVoltage) / ACS_SENSITIVITY;
+}
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("Telemetry transmitter started...");
+
+  // I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // BME280
+  if (bme.begin(0x76)) {
+    bmeOK = true;
+    Serial.println("BME280 OK at 0x76");
+  } else if (bme.begin(0x77)) {
+    bmeOK = true;
+    Serial.println("BME280 OK at 0x77");
+  } else {
+    bmeOK = false;
+    Serial.println("BME280 ERROR");
+  }
+
+  // MPU9250
+  mpu.setWire(&Wire);
+  mpu.beginAccel();
+  mpu.beginGyro();
+  Serial.println("MPU9250 init done");
+
+  // GPS
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("GPS serial started");
+
+  // ACS712
+  analogReadResolution(12);
+  analogSetPinAttenuation(ACS_PIN, ADC_11db);
+  Serial.println("ACS712 ADC started");
+
+  calibrateAcsZero();
+
+  // ESP-NOW
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed!");
+    return;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = ESPNOW_CHANNEL;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("ESP-NOW peer add failed!");
+    return;
+  }
+
+  Serial.println("ESP-NOW broadcast peer added");
+  Serial.println("Telemetry sending started...");
+}
+
+// ================== LOOP ==================
+void loop() {
+  // GPS окуу
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+
+  // MPU9250 окуу
+  mpu.accelUpdate();
+  mpu.gyroUpdate();
+
+  // ACS712 окуу
+  float acsVoltage = readAcsVoltage();
+  uint8_t acsValid = (acsVoltage > 1.0 && acsVoltage < 4.0) ? 1 : 0;
+  float currentA = acsValid ? calculateCurrent(acsVoltage) : 0.0;
+
+  // Пакет толтуруу
+  telemetry.packetId = ++packetCounter;
+  telemetry.timeMs = millis();
+
+  if (bmeOK) {
+    telemetry.temperature = bme.readTemperature();
+    telemetry.pressure = bme.readPressure() / 100.0;
+    telemetry.humidity = bme.readHumidity();
+  } else {
+    telemetry.temperature = 0.0;
+    telemetry.pressure = 0.0;
+    telemetry.humidity = 0.0;
+  }
+
+  telemetry.accelX = mpu.accelX();
+  telemetry.accelY = mpu.accelY();
+  telemetry.accelZ = mpu.accelZ();
+
+  telemetry.gyroX = mpu.gyroX();
+  telemetry.gyroY = mpu.gyroY();
+  telemetry.gyroZ = mpu.gyroZ();
+
+  telemetry.gpsValid = gps.location.isValid() ? 1 : 0;
+
+  if (gps.location.isValid()) {
+    telemetry.latitude = gps.location.lat();
+    telemetry.longitude = gps.location.lng();
+  } else {
+    telemetry.latitude = 0.0;
+    telemetry.longitude = 0.0;
+  }
+
+  telemetry.speedKmh = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
+  telemetry.altitudeM = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+  telemetry.satellites = gps.satellites.isValid() ? gps.satellites.value() : 0;
+
+  telemetry.acsValid = acsValid;
+  telemetry.acsVoltage = acsVoltage;
+  telemetry.currentA = currentA;
+
+  // ESP-NOW жөнөтүү
+  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&telemetry, sizeof(telemetry));
+
+  Serial.print("Packet sent: ");
+  Serial.print(telemetry.packetId);
+
+  if (result == ESP_OK) {
+    Serial.println(" | Send status: Success");
+  } else {
+    Serial.println(" | Send status: Error");
+  }
+
+  Serial.print("Temperature: ");
+  Serial.print(telemetry.temperature, 2);
+  Serial.print(" C | Pressure: ");
+  Serial.print(telemetry.pressure, 2);
+  Serial.print(" hPa | Humidity: ");
+  Serial.print(telemetry.humidity, 2);
+  Serial.println(" %");
+
+  Serial.print("GPS valid: ");
+  Serial.print(telemetry.gpsValid ? "YES" : "NO");
+  Serial.print(" | Lat: ");
+  Serial.print(telemetry.latitude, 6);
+  Serial.print(" | Lon: ");
+  Serial.print(telemetry.longitude, 6);
+  Serial.print(" | Speed: ");
+  Serial.print(telemetry.speedKmh, 2);
+  Serial.print(" km/h | Altitude: ");
+  Serial.print(telemetry.altitudeM, 2);
+  Serial.print(" m | Satellites: ");
+  Serial.println(telemetry.satellites);
+
+  Serial.print("ACS valid: ");
+  Serial.print(telemetry.acsValid ? "YES" : "NO");
+  Serial.print(" | ACS voltage: ");
+  Serial.print(telemetry.acsVoltage, 3);
+  Serial.print(" V | Current: ");
+  Serial.print(telemetry.currentA, 3);
+  Serial.println(" A");
+
+  Serial.println("----------------------------------------");
+
+  delay(1000);
+}
